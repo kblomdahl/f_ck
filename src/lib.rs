@@ -1,19 +1,10 @@
-use std::io::{self, Read, Stdin, Stdout, Write};
+use std::io::{self, Read, Write};
 
 const MEMORY_SIZE: usize = 30_000;
 
-struct Context<I: Read, O: Write> {
-    output: O,
-    input: I,
-}
-
-impl Default for Context<Stdin, Stdout> {
-    fn default() -> Self {
-        Self {
-            output: io::stdout(),
-            input: io::stdin(),
-        }
-    }
+pub struct Context<I: Read, O: Write> {
+    pub output: O,
+    pub input: I,
 }
 
 struct OpImpl<I: Read, O: Write> {
@@ -117,7 +108,7 @@ fn op_read<I: Read, O: Write>(_arg: isize, context: &mut Context<I, O>, memory: 
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Op {
+pub enum Op {
     IncDp(isize),
     IncMemory(isize),
     SetZero,
@@ -166,20 +157,28 @@ impl Op {
 }
 
 #[derive(Debug, PartialEq)]
-enum Parsed {
+pub enum ParseError {
+    UnexpectedChar(u8),
+    UnexpectedEnd,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Parsed {
     Block(Vec<Op>),
     Loop(Vec<Parsed>),
     Once(Vec<Parsed>),
 }
 
-impl From<&[u8]> for Parsed {
-    fn from(program: &[u8]) -> Self {
-        Self::Once(Parsed::parse(program)).rewrite()
+impl TryFrom<&[u8]> for Parsed {
+    type Error = ParseError;
+
+    fn try_from(program: &[u8]) -> Result<Self, Self::Error> {
+        Parsed::parse(program).map(|blocks| Self::Once(blocks).rewrite())
     }
 }
 
 impl Parsed {
-    fn parse(program: &[u8]) -> Vec<Parsed> {
+    fn parse(program: &[u8]) -> Result<Vec<Parsed>, ParseError> {
         let mut blocks = vec! [];
         let mut i = 0;
 
@@ -194,36 +193,37 @@ impl Parsed {
                     i += 1;
                 },
                 b'[' => {
-                    let ends_at = Self::loop_slice_at(&program[i + 1..]) + i;
-                    let sub_blocks = Self::parse(&program[i + 1..ends_at]);
+                    let ends_at = Self::loop_slice_at(&program[i + 1..])? + i;
+                    let sub_blocks = Self::parse(&program[i + 1..ends_at])?;
 
                     blocks.push(Parsed::Loop(sub_blocks));
 
                     i = ends_at + 1;
                 },
-                b']' => { unreachable!("unexpected ] at {}", i) },
+                b']' => { return Err(ParseError::UnexpectedChar(b']')) },
                 _ => { i += 1; },
             }
         }
 
-        blocks
+        Ok(blocks)
     }
 
-    fn loop_slice_at(program: &[u8]) -> usize {
+    fn loop_slice_at(program: &[u8]) -> Result<usize, ParseError> {
         let mut depth = 1;
         let mut i = 0;
 
         while depth > 0 {
-            match program[i] {
-                b'[' => { depth += 1; },
-                b']' => { depth -= 1; },
-                _ => { /* pass */ },
+            match program.get(i) {
+                Some(b'[') => { depth += 1; },
+                Some(b']') => { depth -= 1; },
+                Some(_) => { /* pass */ },
+                None => { return Err(ParseError::UnexpectedEnd); },
             }
 
             i += 1;
         }
 
-        i
+        Ok(i)
     }
 
     fn is_single_op(&self, predicate: impl Fn(&Op) -> bool) -> bool {
@@ -266,7 +266,7 @@ impl Parsed {
     }
 }
 
-struct Compiled<I: Read, O: Write> {
+pub struct Compiled<I: Read, O: Write> {
     ops: Vec<OpImpl<I, O>>,
 }
 
@@ -309,7 +309,7 @@ impl<I: Read, O: Write> Compiled<I, O> {
     }
 }
 
-fn execute<I: Read, O: Write>(context: &mut Context<I, O>, block: &Compiled<I, O>)  -> Result<(), io::Error> {
+pub fn execute<I: Read, O: Write>(context: &mut Context<I, O>, block: &Compiled<I, O>)  -> Result<(), io::Error> {
     let mut memory = vec! [0; 30_000];
 
     dispatch(
@@ -319,18 +319,6 @@ fn execute<I: Read, O: Write>(context: &mut Context<I, O>, block: &Compiled<I, O
         block.ops.as_ptr(),
         0
     )
-}
-
-fn main() -> Result<(), io::Error> {
-    for arg in std::env::args().skip(1) {
-        let program = std::fs::read(&arg)?;
-        let parsed = Parsed::from(&program[..]);
-        let block: Compiled<Stdin, Stdout> = Compiled::from(parsed);
-
-        execute(&mut Context::default(), &block)?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -349,10 +337,10 @@ mod tests {
 
     #[test]
     fn rewrite_consequitive_ops() {
-        let program = b"++>--";
+        let program = b"++><>--";
 
         assert_eq!(
-            Parsed::from(&program[..]),
+            Parsed::try_from(&program[..]).expect("could not parse program"),
             Parsed::Once(vec! [
                 Parsed::Block(vec! [Op::IncMemory(2), Op::IncDp(1), Op::IncMemory(-2)])
             ])
@@ -364,7 +352,7 @@ mod tests {
         let program = b">[[+--]]";
 
         assert_eq!(
-            Parsed::from(&program[..]),
+            Parsed::try_from(&program[..]).expect("could not parse program"),
             Parsed::Once(vec! [
                 Parsed::Block(vec! [Op::IncDp(1)]),
                 Parsed::Block(vec! [Op::SetZero])
@@ -373,28 +361,26 @@ mod tests {
     }
 
     #[test]
-    fn hello_world() -> Result<(), io::Error> {
+    fn hello_world() {
         let program = b">>+<--[[<++>->-->+++>+<<<]-->++++]<<.<<-.<<..+++.>.<<-.>.+++.------.>>-.<+.>>.";
-        let parsed = Parsed::from(&program[..]);
+        let parsed = Parsed::try_from(&program[..]).expect("could not parse program");
         let block = Compiled::from(parsed);
         let mut context = Context::with_input(b"");
 
-        execute(&mut context, &block)?;
+        execute(&mut context, &block).expect("could not execute program");
 
         assert_eq!(context.output, b"Hello World!\n");
-        Ok(())
     }
 
     #[test]
-    fn quick_sort() -> Result<(), io::Error> {
+    fn quick_sort() {
         let program = b">>+>>>>>,[>+>>,]>+[--[+<<<-]<[<+>-]<[<[->[<<<+>>>>+<-]<<[>>+>[->]<<[<]<-]>]>>>+<[[-]<[>+<-]<]>[[>>>]+<<<-<[<<[<<<]>>+>[>>>]<-]<<[<<<]>[>>[>>>]<+<<[<<<]>-]]+<<<]+[->>>]>>]>>[.>>>]";
-        let parsed = Parsed::from(&program[..]);
+        let parsed = Parsed::try_from(&program[..]).expect("could not parse program");
         let block = Compiled::from(parsed);
         let mut context = Context::with_input(b"2635789014");
 
-        execute(&mut context, &block)?;
+        execute(&mut context, &block).expect("could not execute program");
 
         assert_eq!(context.output, b"0123456789");
-        Ok(())
     }
 }
