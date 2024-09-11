@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::{io::{self, Read, Write}, iter::Peekable};
 
 const MEMORY_SIZE: usize = 30_000;
 
@@ -164,7 +164,7 @@ pub enum ParseError {
 
 #[derive(Debug, PartialEq)]
 pub enum Parsed {
-    Block(Vec<Op>),
+    Ops(Vec<Op>),
     Loop(Vec<Parsed>),
     Once(Vec<Parsed>),
 }
@@ -173,95 +173,98 @@ impl TryFrom<&[u8]> for Parsed {
     type Error = ParseError;
 
     fn try_from(program: &[u8]) -> Result<Self, Self::Error> {
-        Parsed::parse(program).map(|blocks| Self::Once(blocks).rewrite())
+        let mut iter = program.iter().copied().peekable();
+        let blocks = Self::parse_blocks_while(&mut iter, |ch| ch != None)?;
+        let mut parsed = Self::Once(blocks);
+        parsed.rewrite();
+
+        Ok(parsed)
     }
 }
 
 impl Parsed {
-    fn parse(program: &[u8]) -> Result<Vec<Parsed>, ParseError> {
-        let mut blocks = vec! [];
-        let mut i = 0;
+    fn parse_ops(program: &mut Peekable<impl Iterator<Item=u8>>) -> Result<Parsed, ParseError> {
+        let mut ops = vec! [];
 
-        while i < program.len() {
-            match program[i] {
-                b'<' | b'>' | b'+' | b'-' | b'.' | b',' => {
-                    if let Some(Parsed::Block(ref mut last_block)) = blocks.last_mut() {
-                        last_block.push(Op::from(program[i]));
-                    } else {
-                        blocks.push(Parsed::Block(vec! [Op::from(program[i])]));
-                    }
-                    i += 1;
-                },
-                b'[' => {
-                    let ends_at = Self::loop_slice_at(&program[i + 1..])? + i;
-                    let sub_blocks = Self::parse(&program[i + 1..ends_at])?;
-
-                    blocks.push(Parsed::Loop(sub_blocks));
-
-                    i = ends_at + 1;
-                },
-                b']' => { return Err(ParseError::UnexpectedChar(b']')) },
-                _ => { i += 1; },
+        while let Some(ch) = program.next_if(|ch| !matches!(ch, b'[' | b']')) {
+            match ch {
+                b'<' | b'>' | b'+' | b'-' | b'.' | b',' => ops.push(Op::from(ch)),
+                _ => { /* pass */ },
             }
+        }
+
+        Ok(Parsed::Ops(ops))
+    }
+
+    fn parse_block(program: &mut Peekable<impl Iterator<Item=u8>>) -> Result<Parsed, ParseError> {
+        match program.peek() {
+            Some(b'[') => Self::parse_loop(program),
+            Some(b']') => Err(ParseError::UnexpectedChar(b']')),
+            Some(_) => Self::parse_ops(program),
+            None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    fn parse_blocks_while(program: &mut Peekable<impl Iterator<Item=u8>>, predicate: impl Fn(Option<&u8>) -> bool) -> Result<Vec<Parsed>, ParseError> {
+        let mut blocks = vec! [];
+
+        while predicate(program.peek()) {
+            blocks.push(Self::parse_block(program)?);
         }
 
         Ok(blocks)
     }
 
-    fn loop_slice_at(program: &[u8]) -> Result<usize, ParseError> {
-        let mut depth = 1;
-        let mut i = 0;
+    fn parse_loop(program: &mut Peekable<impl Iterator<Item=u8>>) -> Result<Parsed, ParseError> {
+        assert_eq!(program.next(), Some(b'['));
 
-        while depth > 0 {
-            match program.get(i) {
-                Some(b'[') => { depth += 1; },
-                Some(b']') => { depth -= 1; },
-                Some(_) => { /* pass */ },
-                None => { return Err(ParseError::UnexpectedEnd); },
-            }
+        let blocks = Self::parse_blocks_while(program, |ch| ch != Some(&b']'))?;
+        let _ = program.next();  // this must be b']'
 
-            i += 1;
-        }
-
-        Ok(i)
+        Ok(Parsed::Loop(blocks))
     }
 
     fn is_single_op(&self, predicate: impl Fn(&Op) -> bool) -> bool {
         match self {
-            Self::Block(ops) => ops.len() == 1 && predicate(&ops[0]),
+            Self::Ops(ops) => ops.len() == 1 && predicate(&ops[0]),
             _ => false,
         }
     }
 
-    fn merge_consecutive_ops(ops: &[Op]) -> Vec<Op> {
-        let mut merged: Vec<Op> = vec! [];
+    fn merge_consecutive_ops(ops: &mut Vec<Op>) {
+        let len = ops.len();
+        let mut read_at = 1;
+        let mut merge_at = 0;
 
-        for op in ops {
-            if let Some(last_merged) = merged.last_mut() {
-                if !last_merged.try_merge(op) {
-                    merged.push(op.clone());
-                }
+        while read_at < len {
+            debug_assert!(merge_at < read_at);
+
+            let to_try_merge = ops[read_at].clone();
+
+            if ops[merge_at].try_merge(&to_try_merge) {
+                read_at += 1;
             } else {
-                merged.push(op.clone());
+                ops[merge_at + 1] = ops[read_at].clone();
+
+                merge_at += 1;
+                read_at += 1;
             }
         }
 
-        merged
+        ops.truncate(merge_at + 1);
     }
 
-    fn rewrite(self) -> Self {
+    fn rewrite(&mut self) {
         match self {
-            Self::Block(ops) => Self::Block(Self::merge_consecutive_ops(&ops)),
-            Self::Loop(sub_blocks) => {
-                let new_sub_blocks = sub_blocks.into_iter().map(Self::rewrite).collect::<Vec<Parsed>>();
+            Self::Ops(ops) => Self::merge_consecutive_ops(ops),
+            Self::Loop(blocks) => {
+                blocks.iter_mut().for_each(Self::rewrite);
 
-                if new_sub_blocks.len() == 1 && (new_sub_blocks[0].is_single_op(|op| Op::SetZero.eq(op) || Op::IncMemory(-1).eq(op))) {
-                    Self::Block(vec! [Op::SetZero])
-                } else {
-                    Self::Loop(new_sub_blocks)
+                if blocks.len() == 1 && (blocks[0].is_single_op(|op| Op::SetZero.eq(op) || Op::IncMemory(-1).eq(op))) {
+                    *self = Self::Ops(vec! [Op::SetZero])
                 }
             },
-            Self::Once(blocks) => Self::Once(blocks.into_iter().map(Self::rewrite).collect())
+            Self::Once(blocks) => blocks.iter_mut().for_each(Self::rewrite),
         }
     }
 }
@@ -272,7 +275,9 @@ pub struct Compiled<I: Read, O: Write> {
 
 impl<I: Read, O: Write> From<&Parsed> for Compiled<I, O> {
     fn from(parsed: &Parsed) -> Self {
-        let mut ops = Self::compile(parsed);
+        let mut ops = vec! [];
+
+        Self::compile(parsed, &mut ops);
         ops.push(OpImpl { op: op_halt, arg: 0 });
 
         Self { ops }
@@ -280,32 +285,31 @@ impl<I: Read, O: Write> From<&Parsed> for Compiled<I, O> {
 }
 
 impl<I: Read, O: Write> Compiled<I, O> {
-    fn compile(parsed: &Parsed) -> Vec<OpImpl<I, O>> {
-        let mut ops = vec! [];
-
+    fn compile(parsed: &Parsed, ops: &mut Vec<OpImpl<I, O>>) {
         match parsed {
-            Parsed::Block(block) => {
+            Parsed::Ops(block) => {
                 ops.extend(block.iter().map(Op::to_impl));
             },
-            Parsed::Loop(sub_blocks) => {
-                let mut loop_ops = vec! [];
+            Parsed::Loop(blocks) => {
+                let starts_at = ops.len();
 
-                for sub_block in sub_blocks {
-                    loop_ops.extend(Self::compile(sub_block));
+                ops.push(OpImpl { op: op_jmp_zero, arg: 0 });
+
+                for block in blocks {
+                    Self::compile(block, ops);
                 }
 
-                ops.push(OpImpl { op: op_jmp_zero, arg: loop_ops.len() as isize + 2 });
-                ops.extend_from_slice(&loop_ops);
-                ops.push(OpImpl { op: op_jmp_non_zero, arg: -(loop_ops.len() as isize) });
+                let loop_len = ops.len() - starts_at;
+
+                ops[starts_at].arg = loop_len as isize + 1;
+                ops.push(OpImpl { op: op_jmp_non_zero, arg: -(loop_len as isize - 1) });
             },
             Parsed::Once(blocks) => {
                 for block in blocks {
-                    ops.extend(Self::compile(block));
+                    Self::compile(block, ops);
                 }
             },
         }
-
-        ops
     }
 }
 
@@ -336,13 +340,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed() {
+        assert_eq!(Parsed::try_from(b"[".as_slice()), Err(ParseError::UnexpectedEnd));
+        assert_eq!(Parsed::try_from(b"]".as_slice()), Err(ParseError::UnexpectedChar(b']')));
+    }
+
+    #[test]
     fn rewrite_consequitive_ops() {
         let program = b"++><>--";
 
         assert_eq!(
             Parsed::try_from(&program[..]).expect("could not parse program"),
             Parsed::Once(vec! [
-                Parsed::Block(vec! [Op::IncMemory(2), Op::IncDp(1), Op::IncMemory(-2)])
+                Parsed::Ops(vec! [Op::IncMemory(2), Op::IncDp(1), Op::IncMemory(-2)])
             ])
         );
     }
@@ -354,8 +364,8 @@ mod tests {
         assert_eq!(
             Parsed::try_from(&program[..]).expect("could not parse program"),
             Parsed::Once(vec! [
-                Parsed::Block(vec! [Op::IncDp(1)]),
-                Parsed::Block(vec! [Op::SetZero])
+                Parsed::Ops(vec! [Op::IncDp(1)]),
+                Parsed::Ops(vec! [Op::SetZero])
             ])
         );
     }
