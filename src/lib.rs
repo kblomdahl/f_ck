@@ -12,12 +12,6 @@ struct OpImpl<I: Read, O: Write> {
     arg: isize,
 }
 
-impl<I: Read, O: Write> Clone for OpImpl<I, O> {
-    fn clone(&self) -> Self {
-        Self { op: self.op, arg: self.arg }
-    }
-}
-
 fn dispatch<I: Read, O: Write>(context: &mut Context<I, O>, memory: *mut u8, dp: usize, program: *const OpImpl<I, O>, offset: isize) -> Result<(), io::Error> {
     let program = unsafe { program.offset(offset) };
     let op: &OpImpl<I, O> = unsafe { &*program };
@@ -116,16 +110,18 @@ pub enum Op {
     Read,
 }
 
-impl From<u8> for Op {
-    fn from(ch: u8) -> Self {
+impl TryFrom<u8> for Op {
+    type Error = ();
+
+    fn try_from(ch: u8) -> Result<Self, Self::Error> {
         match ch {
-            b'<' => Op::IncDp(-1),
-            b'>' => Op::IncDp(1),
-            b'+' => Op::IncMemory(1),
-            b'-' => Op::IncMemory(-1),
-            b'.' => Op::Write,
-            b',' => Op::Read,
-            _ => unreachable!("unexpected op: {}", ch),
+            b'<' => Ok(Op::IncDp(-1)),
+            b'>' => Ok(Op::IncDp(1)),
+            b'+' => Ok(Op::IncMemory(1)),
+            b'-' => Ok(Op::IncMemory(-1)),
+            b'.' => Ok(Op::Write),
+            b',' => Ok(Op::Read),
+            _ => Err(()),
         }
     }
 }
@@ -187,9 +183,8 @@ impl Parsed {
         let mut ops = vec! [];
 
         while let Some(ch) = program.next_if(|ch| !matches!(ch, b'[' | b']')) {
-            match ch {
-                b'<' | b'>' | b'+' | b'-' | b'.' | b',' => ops.push(Op::from(ch)),
-                _ => { /* pass */ },
+            if let Ok(op) = Op::try_from(ch) {
+                ops.push(op);
             }
         }
 
@@ -347,7 +342,7 @@ mod tests {
 
     #[test]
     fn rewrite_consequitive_ops() {
-        let program = b"++><>--";
+        let program = b"++ ><> --";
 
         assert_eq!(
             Parsed::try_from(&program[..]).expect("could not parse program"),
@@ -368,6 +363,29 @@ mod tests {
                 Parsed::Ops(vec! [Op::SetZero])
             ])
         );
+    }
+
+    #[test]
+    fn out_of_bounds() {
+        const PROGRAMS: [&[u8]; 6] = [
+            b"<.".as_slice(),
+            b"<,".as_slice(),
+            b"<+".as_slice(),
+            b"<[-]".as_slice(),
+            b"+[<<]".as_slice(),
+            b"<[[+]]".as_slice(),
+        ];
+
+        for program in PROGRAMS {
+            let parsed = Parsed::try_from(&program[..]).expect("could not parse program");
+            let block = Compiled::from(&parsed);
+            let mut context = Context::with_input(b"");
+
+            assert_eq!(
+                execute(&mut context, &block).expect_err("program should fail").kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[test]
