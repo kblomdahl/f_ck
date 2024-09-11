@@ -131,10 +131,10 @@ impl From<u8> for Op {
 }
 
 impl Op {
-    fn to_impl<I: Read, O: Write>(self) -> OpImpl<I, O> {
+    fn to_impl<I: Read, O: Write>(&self) -> OpImpl<I, O> {
         match self {
-            Self::IncDp(arg) => OpImpl { op: op_inc_dp, arg },
-            Self::IncMemory(arg) => OpImpl { op: op_inc_memory, arg },
+            Self::IncDp(arg) => OpImpl { op: op_inc_dp, arg: *arg },
+            Self::IncMemory(arg) => OpImpl { op: op_inc_memory, arg: *arg },
             Self::SetZero => OpImpl { op: op_set_zero, arg: 0 },
             Self::Write => OpImpl { op: op_write, arg: 0 },
             Self::Read => OpImpl { op: op_read, arg: 0 },
@@ -270,8 +270,8 @@ pub struct Compiled<I: Read, O: Write> {
     ops: Vec<OpImpl<I, O>>,
 }
 
-impl<I: Read, O: Write> From<Parsed> for Compiled<I, O> {
-    fn from(parsed: Parsed) -> Self {
+impl<I: Read, O: Write> From<&Parsed> for Compiled<I, O> {
+    fn from(parsed: &Parsed) -> Self {
         let mut ops = Self::compile(parsed);
         ops.push(OpImpl { op: op_halt, arg: 0 });
 
@@ -280,12 +280,12 @@ impl<I: Read, O: Write> From<Parsed> for Compiled<I, O> {
 }
 
 impl<I: Read, O: Write> Compiled<I, O> {
-    fn compile(parsed: Parsed) -> Vec<OpImpl<I, O>> {
+    fn compile(parsed: &Parsed) -> Vec<OpImpl<I, O>> {
         let mut ops = vec! [];
 
         match parsed {
             Parsed::Block(block) => {
-                ops.extend(block.into_iter().map(Op::to_impl));
+                ops.extend(block.iter().map(Op::to_impl));
             },
             Parsed::Loop(sub_blocks) => {
                 let mut loop_ops = vec! [];
@@ -364,7 +364,7 @@ mod tests {
     fn hello_world() {
         let program = b">>+<--[[<++>->-->+++>+<<<]-->++++]<<.<<-.<<..+++.>.<<-.>.+++.------.>>-.<+.>>.";
         let parsed = Parsed::try_from(&program[..]).expect("could not parse program");
-        let block = Compiled::from(parsed);
+        let block = Compiled::from(&parsed);
         let mut context = Context::with_input(b"");
 
         execute(&mut context, &block).expect("could not execute program");
@@ -376,7 +376,7 @@ mod tests {
     fn quick_sort() {
         let program = b">>+>>>>>,[>+>>,]>+[--[+<<<-]<[<+>-]<[<[->[<<<+>>>>+<-]<<[>>+>[->]<<[<]<-]>]>>>+<[[-]<[>+<-]<]>[[>>>]+<<<-<[<<[<<<]>>+>[>>>]<-]<<[<<<]>[>>[>>>]<+<<[<<<]>-]]+<<<]+[->>>]>>]>>[.>>>]";
         let parsed = Parsed::try_from(&program[..]).expect("could not parse program");
-        let block = Compiled::from(parsed);
+        let block = Compiled::from(&parsed);
         let mut context = Context::with_input(b"2635789014");
 
         execute(&mut context, &block).expect("could not execute program");

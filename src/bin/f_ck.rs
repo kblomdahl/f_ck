@@ -12,7 +12,7 @@ fn main() -> Result<(), io::Error> {
 
         match Parsed::try_from(&program[..]) {
             Ok(parsed) => {
-                execute(&mut context, &Compiled::from(parsed))?;
+                execute(&mut context, &Compiled::from(&parsed))?;
             },
             Err(err) => {
                 eprintln!("{}: {:?}", arg, err);
